@@ -11,8 +11,8 @@
 Нужен Xcode Command Line Tools (`swiftc`).
 ```
 ./build.sh      # собирает MihomoBar.app
-./install.sh    # один раз: root-хелпер + sudoers (запросит пароль администратора)
-open MihomoBar.app
+./build.sh dmg  # то же + MihomoBar.dmg
+open MihomoBar.app   # при первом запуске предложит установить root-хелпер (или ./install.sh вручную)
 ```
 Хелпер `mihomo-ctl` ставится в `/usr/local/libexec`, sudoers разрешает без пароля только его. Блокировка — `pf` anchor `com.apple/mihomobar`.
 Аварийно: `sudo /usr/local/libexec/mihomo-ctl unblock`.
@@ -21,9 +21,9 @@ open MihomoBar.app
 См. [windows/README.md](windows/README.md). Сборка — `windows\build.cmd` (штатный .NET Framework 4, SDK не нужен).
 
 ## Готовые сборки
-Скачайте из Releases: `MihomoBar-windows.zip` или `MihomoBar-macos.zip`.
+Скачайте из Releases: `MihomoBar.dmg` (macOS) или `MihomoBar-windows.zip`.
+- **macOS:** откройте DMG, перетащите `MihomoBar.app` в «Программы». Приложение не нотаризовано (подпись ad-hoc), поэтому один раз выполните в терминале `xattr -cr /Applications/MihomoBar.app` (или «Системные настройки» → «Конфиденциальность и безопасность» → «Всё равно открыть»). При первом запуске приложение само предложит установить root-хелпер (системное окно пароля), затем попросит ссылку на конфиг.
 - **Windows:** `MihomoBar.exe` не подписан сертификатом издателя — SmartScreen покажет предупреждение: «Подробнее» → «Выполнить в любом случае». Перед распаковкой можно снять пометку: свойства zip → «Разблокировать».
-- **macOS:** `.app` подписан только ad-hoc; после скачивания выполните `xattr -cr MihomoBar.app`, затем `./install.sh` из той же папки.
 
 ## Известные ограничения
 - Аварийная блокировка на macOS (`pf` anchor `com.apple/mihomobar`) вживую протестирована ограниченно — держите под рукой `sudo /usr/local/libexec/mihomo-ctl unblock`.

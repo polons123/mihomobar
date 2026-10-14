@@ -291,17 +291,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func offerHelperUpdate() {
         let a = NSAlert()
-        a.messageText = "Хелпер устарел"
-        a.informativeText = "Установленный mihomo-ctl (версия \(helperVersion ?? "неизвестна")) не совместим с приложением (нужна \(expectedHelper)). Без обновления не работают откат и блокировка. Обновить сейчас? Потребуется пароль администратора."
-        a.addButton(withTitle: "Обновить")
+        if let hv = helperVersion {
+            a.messageText = "Хелпер устарел"
+            a.informativeText = "Установленный mihomo-ctl (версия \(hv)) не совместим с приложением (нужна \(expectedHelper)). Без обновления не работают откат и блокировка. Обновить сейчас? Потребуется пароль администратора."
+            a.addButton(withTitle: "Обновить")
+        } else {
+            a.messageText = "Нужна первоначальная установка"
+            a.informativeText = "Для управления ядром с правами администратора нужно один раз установить компонент mihomo-ctl и правило sudoers (только на этот файл). Потребуется пароль администратора."
+            a.addButton(withTitle: "Установить")
+        }
         a.addButton(withTitle: "Позже")
         NSApp.activate(ignoringOtherApps: true)
         if a.runModal() == .alertFirstButtonReturn { updateHelper() }
     }
 
     @objc func updateHelper() {
-        let script = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("install.sh").path
-        guard FileManager.default.fileExists(atPath: script) else { alert("Не найден \(script). Запустите install.sh вручную."); return }
+        // install.sh и mihomo-ctl лежат внутри .app (Resources); для сборки из исходников — рядом с .app
+        let inApp = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/install.sh").path
+        let beside = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("install.sh").path
+        guard let script = [inApp, beside].first(where: { FileManager.default.fileExists(atPath: $0) }) else { alert("Не найден install.sh. Скачайте релиз заново."); return }
         busy = true; rebuild()
         DispatchQueue.global().async {
             let p = Process()
@@ -314,7 +322,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.busy = false
                 self.helperVersion = v.code == 0 ? v.out : nil
                 self.helperOutdated = !(v.code == 0 && v.out == expectedHelper)
-                if self.helperOutdated { self.alert("Обновить хелпер не удалось. Выполните в терминале: ~/mihomobar/install.sh") }
+                if self.helperOutdated { self.alert("Обновить хелпер не удалось. Запустите install.sh из папки с приложением в терминале.") }
                 self.rebuild()
             }
         }
