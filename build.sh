@@ -3,7 +3,10 @@ set -e
 cd "$(dirname "$0")"
 APP=MihomoBar.app
 rm -rf $APP; mkdir -p $APP/Contents/MacOS
-swiftc -O -o $APP/Contents/MacOS/MihomoBar MihomoBar.swift
+# универсальный бинарь (Apple Silicon + Intel), минимум macOS 14
+for A in arm64 x86_64; do swiftc -O -target $A-apple-macos14.0 -o /tmp/MihomoBar-$A MihomoBar.swift; done
+lipo -create /tmp/MihomoBar-arm64 /tmp/MihomoBar-x86_64 -output $APP/Contents/MacOS/MihomoBar
+rm -f /tmp/MihomoBar-arm64 /tmp/MihomoBar-x86_64
 mkdir -p $APP/Contents/Resources
 cp install.sh mihomo-ctl AppIcon.icns $APP/Contents/Resources/
 cat > $APP/Contents/Info.plist <<P
@@ -16,6 +19,7 @@ cat > $APP/Contents/Info.plist <<P
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 P
