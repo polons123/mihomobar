@@ -1,0 +1,27 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:59096
+secret: "selftest"
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+dns:
+  enable: true
+  enhanced-mode: redir-host
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,DIRECT

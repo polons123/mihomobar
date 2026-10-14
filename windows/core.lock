@@ -1,0 +1,4 @@
+# Проверенные при загрузке SHA-256 (скачаны с GitHub-релизов MetaCubeX/mihomo и wireguard.com)
+mihomo-windows-amd64-v1.19.32.zip  1ac84e795b5b915446e20139677fb6cc013a0778e876e8d4c96f994750b4c4a3
+mihomo-windows-arm64-v1.19.32.zip  7a4f6e58af9a120920935f2150cf642d945085fdb3e753314505b334234e1d1e
+wintun-0.14.1.zip            07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51

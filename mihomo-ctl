@@ -1,0 +1,140 @@
+#!/bin/bash
+# Root-хелпер для MihomoBar. Ставится в /usr/local/libexec (root-owned), вызывается через sudoers NOPASSWD.
+# Использование: mihomo-ctl version | core-version | status | blockstatus | install-config (YAML со stdin)
+#                | install-core (бинарь со stdin) | rollback | start | stop | block | unblock
+set -u
+VERSION=5
+CFGDIR="/usr/local/etc/mihomobar"
+DATA="$CFGDIR/data"      # рабочая папка mihomo (geo, ui, кэш), принадлежит root
+CFG="$CFGDIR/config.yaml"
+PREV="$CFGDIR/config.prev.yaml"
+BIN="/usr/local/libexec/mihomo"
+PIDF="/var/run/mihomobar.pid"
+PFTOKEN="/var/run/mihomobar.pftoken"
+PFRULES="$CFGDIR/pf-block.conf"
+# Блокировка живёт в подчинённом anchor: в стандартном /etc/pf.conf есть `anchor "com.apple/*"`,
+# поэтому основные правила системы не трогаем и не перезагружаем.
+ANCHOR="com.apple/mihomobar"
+LOG="/var/log/mihomobar.log"
+LOCKD="/var/run/mihomobar.lock.d"
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+# Взаимное исключение для команд, меняющих состояние (flock на macOS нет — mkdir атомарен).
+lock() {
+  for _ in $(seq 1 60); do
+    if mkdir "$LOCKD" 2>/dev/null; then echo $$ > "$LOCKD/pid"; trap 'rm -rf "$LOCKD"' EXIT; return 0; fi
+    owner=$(cat "$LOCKD/pid" 2>/dev/null)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$LOCKD"; continue; fi
+    sleep 0.5
+  done
+  echo "хелпер занят другой операцией" >&2; exit 6
+}
+
+stop() {
+  if running; then
+    kill "$(cat "$PIDF")"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.5; done
+    running && kill -9 "$(cat "$PIDF")"
+  fi
+  pkill -x mihomo 2>/dev/null   # заодно ручной запуск через sudo mihomo
+  rm -f "$PIDF"
+}
+
+blocked() { pfctl -a "$ANCHOR" -sr 2>/dev/null | grep -q "block"; }
+
+pf_release() {
+  if [ -f "$PFTOKEN" ]; then
+    tok=$(cat "$PFTOKEN"); [ -n "$tok" ] && pfctl -X "$tok" >/dev/null 2>&1
+    rm -f "$PFTOKEN"
+  fi
+}
+
+case "${1:-}" in
+  version) echo "$VERSION" ;;
+  core-version)
+    # версия установленного ядра (учитывает обновление из панели); пусто, если ядра нет или оно не запускается
+    [ -x "$BIN" ] && "$BIN" -v 2>/dev/null | sed -n 's/.* \(v[0-9][0-9.]*\).*/\1/p' | head -1
+    ;;
+  install-core)
+    # Ставит ядро только если его нет, оно не запускается или присланное новее. Имя файла всегда mihomo —
+    # так встроенное обновление из панели заменяет его на месте (от root, в root-папке).
+    lock
+    mkdir -p "$(dirname "$BIN")" "$CFGDIR"
+    tmp=$(mktemp "$CFGDIR/.core.XXXXXX") || exit 1
+    cat > "$tmp"; chmod 755 "$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; echo "пустой файл ядра" >&2; exit 2; }
+    newv=$("$tmp" -v 2>/dev/null | sed -n 's/.* \(v[0-9][0-9.]*\).*/\1/p' | head -1)
+    [ -n "$newv" ] || { rm -f "$tmp"; echo "присланное ядро не запускается" >&2; exit 2; }
+    curv=""; [ -x "$BIN" ] && curv=$("$BIN" -v 2>/dev/null | sed -n 's/.* \(v[0-9][0-9.]*\).*/\1/p' | head -1)
+    if [ -n "$curv" ] && [ "$(printf '%s\n%s\n' "$curv" "$newv" | sort -V | tail -1)" = "$curv" ]; then
+      rm -f "$tmp"; echo "kept $curv"; exit 0
+    fi
+    chown root:wheel "$tmp"; xattr -c "$tmp" 2>/dev/null
+    mv -f "$tmp" "$BIN"
+    echo "installed $newv"
+    ;;
+  status) running && echo running || { pgrep -x mihomo >/dev/null && echo running || echo stopped; } ;;
+  blockstatus) blocked && echo blocked || echo open ;;
+  install-config)
+    lock
+    mkdir -p "$CFGDIR" "$DATA"
+    tmp=$(mktemp "$CFGDIR/.new.XXXXXX") || exit 1
+    cat > "$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; echo "empty config" >&2; exit 2; }
+    if ! out=$("$BIN" -t -d "$DATA" -f "$tmp" 2>&1); then
+      rm -f "$tmp"; echo "конфиг не прошёл проверку: $(echo "$out" | tail -n 1)" >&2; exit 3
+    fi
+    chmod 644 "$tmp"; chown root:wheel "$tmp"
+    # прежний конфиг — в резерв (если содержимое реально изменилось)
+    if [ -f "$CFG" ] && ! cmp -s "$CFG" "$tmp"; then cp -p "$CFG" "$PREV"; fi
+    mv -f "$tmp" "$CFG"
+    ;;
+  rollback)
+    lock
+    [ -f "$PREV" ] || { echo "нет прежнего конфига" >&2; exit 2; }
+    "$BIN" -t -d "$DATA" -f "$PREV" >/dev/null 2>&1 || { echo "прежний конфиг не проходит проверку" >&2; exit 3; }
+    # меняем текущий и прежний местами, чтобы откат можно было отменить
+    cp -p "$CFG" "$CFGDIR/.swap" 2>/dev/null
+    cp -p "$PREV" "$CFG.tmp" && mv -f "$CFG.tmp" "$CFG"
+    [ -s "$CFGDIR/.swap" ] && mv -f "$CFGDIR/.swap" "$PREV"
+    ;;
+  start)
+    lock
+    mkdir -p "$DATA"
+    [ -f "$CFG" ] || { echo "конфиг ещё не загружен" >&2; exit 2; }
+    "$BIN" -t -d "$DATA" -f "$CFG" >/dev/null 2>&1 || { echo "config test failed" >&2; exit 3; }
+    stop
+    nohup "$BIN" -d "$DATA" -f "$CFG" >"$LOG" 2>&1 &
+    echo $! > "$PIDF"
+    sleep 1; running || { echo "mihomo завершился, см. $LOG" >&2; exit 4; }
+    ;;
+  stop) lock; stop ;;
+  block)
+    # Аварийная блокировка: режем всё, кроме loopback и DHCP. Каждый шаг проверяется;
+    # при любой ошибке всё откатывается и возвращается код 5.
+    lock
+    mkdir -p "$CFGDIR"
+    cat > "$PFRULES" <<'PF'
+pass quick on lo0 all
+pass quick proto udp from any port 68 to any port 67
+pass quick proto udp from any port 67 to any port 68
+block drop quick all
+PF
+    stop
+    fail() { pfctl -a "$ANCHOR" -F all >/dev/null 2>&1; pf_release; echo "блокировка не включилась: $1" >&2; exit 5; }
+    pfctl -a "$ANCHOR" -f "$PFRULES" >/dev/null 2>&1 || fail "правила не загрузились"
+    tok=$(pfctl -E 2>&1 | sed -n 's/^Token : //p')
+    [ -n "$tok" ] || fail "pf не включился (нет токена)"
+    echo "$tok" > "$PFTOKEN"
+    pfctl -s info 2>/dev/null | grep -q "Status: Enabled" || fail "pf выключен"
+    blocked || fail "правила не применились"
+    ;;
+  unblock)
+    lock
+    pfctl -a "$ANCHOR" -F all >/dev/null 2>&1
+    pf_release
+    blocked && { echo "блокировка не снялась" >&2; exit 5; }
+    ;;
+  *) echo "usage: $0 version|core-version|install-core|status|blockstatus|install-config|rollback|start|stop|block|unblock" >&2; exit 1 ;;
+esac
