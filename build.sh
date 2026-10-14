@@ -5,7 +5,7 @@ APP=MihomoBar.app
 rm -rf $APP; mkdir -p $APP/Contents/MacOS
 swiftc -O -o $APP/Contents/MacOS/MihomoBar MihomoBar.swift
 mkdir -p $APP/Contents/Resources
-cp install.sh mihomo-ctl $APP/Contents/Resources/
+cp install.sh mihomo-ctl AppIcon.icns $APP/Contents/Resources/
 cat > $APP/Contents/Info.plist <<P
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -13,6 +13,7 @@ cat > $APP/Contents/Info.plist <<P
 <key>CFBundleName</key><string>MihomoBar</string>
 <key>CFBundleIdentifier</key><string>local.mihomobar</string>
 <key>CFBundleExecutable</key><string>MihomoBar</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSUIElement</key><true/>
