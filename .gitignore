@@ -1,6 +1,8 @@
 .DS_Store
 *.app/
-*.zip
 *.dmg
+*.zip
 dmg-root/
+release/
 windows/dist/
+windows/obj/

@@ -180,7 +180,7 @@ namespace MihomoBar
     // ---- состояние на диске ----
     class Store
     {
-        public string Url, LocalPath; public bool UseLocal;
+        public string Url, LocalPath, UpdateSkipped; public bool UseLocal; public bool KillSwitch = true, AutoUpdate = true; public long UpdateLast;
         static readonly JavaScriptSerializer Js = new JavaScriptSerializer();
         public static Store Load()
         {
@@ -193,6 +193,10 @@ namespace MihomoBar
                     if (d.ContainsKey("url")) s.Url = d["url"] as string;
                     if (d.ContainsKey("local")) s.LocalPath = d["local"] as string;
                     if (d.ContainsKey("mode")) s.UseLocal = (d["mode"] as string) == "local";
+                    if (d.ContainsKey("killswitch") && d["killswitch"] is bool) s.KillSwitch = (bool)d["killswitch"];
+                    if (d.ContainsKey("autoupdate") && d["autoupdate"] is bool) s.AutoUpdate = (bool)d["autoupdate"];
+                    if (d.ContainsKey("updatelast")) { try { s.UpdateLast = Convert.ToInt64(d["updatelast"]); } catch { } }
+                    if (d.ContainsKey("updateskipped")) s.UpdateSkipped = d["updateskipped"] as string;
                 }
             }
             catch { }
@@ -205,6 +209,7 @@ namespace MihomoBar
                 Directory.CreateDirectory(P.DataDir);
                 var d = new Dictionary<string, object>();
                 d["url"] = Url; d["local"] = LocalPath; d["mode"] = UseLocal ? "local" : "remote";
+                d["killswitch"] = KillSwitch; d["autoupdate"] = AutoUpdate; d["updatelast"] = UpdateLast; d["updateskipped"] = UpdateSkipped;
                 File.WriteAllText(P.Settings, Js.Serialize(d), Encoding.UTF8);
             }
             catch { }
@@ -271,7 +276,7 @@ namespace MihomoBar
 
         static int Cmp(string a, string b) { return new Version(a).CompareTo(new Version(b)); }
 
-        static byte[] Http(string url, int timeoutMs)
+        public static byte[] Http(string url, int timeoutMs)
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
             var req = (HttpWebRequest)WebRequest.Create(url);
@@ -538,6 +543,7 @@ namespace MihomoBar
 
         bool running, busy, recovering, blocked, desired, apiOK, firstRefresh = true;
         string exitNode, note, speed, ipLine, lastError, coreVersion;
+        bool updating, updateBusy; string availableVersion;
         int attempts; DateTime? stableSince;
         bool haveLast; double lastDown, lastUp; DateTime lastAt;
 
@@ -561,7 +567,94 @@ namespace MihomoBar
             {
                 if (Kill.RuleExists()) UI(delegate { blocked = true; Rebuild(false); OfferUnblock(); });
             });
+            Upd.CleanOld();
+            CheckUpdatesOnLaunch();
             if (string.IsNullOrEmpty(S.Url) && !S.UseLocal) UI(delegate { AskUrl(true); });
+        }
+
+        // ---------- обновления ----------
+        void CheckUpdatesOnLaunch()
+        {
+            if (!S.AutoUpdate || Upd.CurrentVersion() == null) return;
+            long now = Upd.Now();
+            if (now - S.UpdateLast < 24 * 3600) return;
+            RunUpdateCheck(false);
+        }
+
+        void RunUpdateCheck(bool manual)
+        {
+            if (updateBusy) return;
+            string cur = Upd.CurrentVersion();
+            if (cur == null) { if (manual) Alert("Не удалось определить версию приложения."); return; }
+            updateBusy = true; Rebuild(true);
+            Task.Run(delegate
+            {
+                string ver = null, notes = "", page = null, err = null;
+                try
+                {
+                    string api = Environment.GetEnvironmentVariable("MIHOMOBAR_UPDATE_API") ?? "https://api.github.com/repos/" + Upd.Repo + "/releases/latest";
+                    var o = new JavaScriptSerializer().DeserializeObject(Encoding.UTF8.GetString(Core.Http(api, 15000))) as Dictionary<string, object>;
+                    string tag = o != null && o.ContainsKey("tag_name") ? o["tag_name"] as string : null;
+                    bool bad = o == null || (o.ContainsKey("draft") && o["draft"] is bool && (bool)o["draft"]) || (o.ContainsKey("prerelease") && o["prerelease"] is bool && (bool)o["prerelease"]);
+                    if (tag == null || bad || Upd.Parse(tag) == null) err = "не удалось разобрать ответ сервера обновлений";
+                    else
+                    {
+                        ver = tag.StartsWith("v") ? tag.Substring(1) : tag;
+                        notes = o.ContainsKey("body") ? (o["body"] as string ?? "") : "";
+                        page = o.ContainsKey("html_url") ? o["html_url"] as string : null;
+                    }
+                }
+                catch (Exception e) { err = e.Message; }
+                UI(delegate
+                {
+                    updateBusy = false;
+                    if (err != null)
+                    {
+                        lastError = "проверка обновлений: " + err; Rebuild(true);
+                        if (manual) Alert("Не удалось проверить обновления: " + err);
+                        return;
+                    }
+                    S.UpdateLast = Upd.Now(); S.Save();
+                    if (Upd.IsNewer(ver, cur))
+                    {
+                        availableVersion = ver; Rebuild(true);
+                        if (manual || S.UpdateSkipped != ver) OfferUpdate(ver, notes, page, cur);
+                    }
+                    else
+                    {
+                        availableVersion = null; Rebuild(true);
+                        if (manual) Info("У вас последняя версия: MihomoBar " + cur + ".");
+                    }
+                });
+            });
+        }
+
+        void OfferUpdate(string ver, string notes, string page, string cur)
+        {
+            notes = (notes ?? "").Trim(); if (notes.Length > 700) notes = notes.Substring(0, 700);
+            string text = "Доступна версия " + ver + ". Установлена " + cur + "." + (notes.Length > 0 ? "\n\n" + notes : "") +
+                          "\n\nПрокси продолжит работать, приложение перезапустится.\n\nДа — установить и перезапустить\nНет — пропустить эту версию\nОтмена — позже";
+            var r = Ask(text, MessageBoxButtons.YesNoCancel);
+            if (r == DialogResult.Yes) InstallUpdate(ver);
+            else if (r == DialogResult.No) { S.UpdateSkipped = ver; S.Save(); }
+        }
+
+        void InstallUpdate(string ver)
+        {
+            updateBusy = true; busy = true; note = "Загрузка обновления " + ver + "…"; Rebuild(true);
+            Task.Run(delegate
+            {
+                string err = Upd.DownloadAndApply(ver);
+                UI(delegate
+                {
+                    if (err != null)
+                    {
+                        updateBusy = false; busy = false; note = null; lastError = "обновление: " + err; Rebuild(true);
+                        Alert("Не удалось установить обновление: " + err + "\n\nУстановленная версия не изменена.");
+                    }
+                    else { updating = true; Quit(); }
+                });
+            });
         }
 
         void UI(Action a) { if (ui.IsHandleCreated) ui.BeginInvoke(a); }
@@ -595,6 +688,11 @@ namespace MihomoBar
         void Alert(string text)
         {
             lastError = text;
+            using (var owner = new Form { TopMost = true, ShowInTaskbar = false, StartPosition = FormStartPosition.CenterScreen, Opacity = 0, Size = new Size(1, 1) })
+            { owner.Show(); MessageBox.Show(owner, text, "MihomoBar", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+        }
+        void Info(string text)
+        {
             using (var owner = new Form { TopMost = true, ShowInTaskbar = false, StartPosition = FormStartPosition.CenterScreen, Opacity = 0, Size = new Size(1, 1) })
             { owner.Show(); MessageBox.Show(owner, text, "MihomoBar", MessageBoxButtons.OK, MessageBoxIcon.Information); }
         }
@@ -653,7 +751,7 @@ namespace MihomoBar
             }
             stableSince = null;
             attempts++;
-            if (attempts > MaxAttempts) { LockDown(); return; }
+            if (attempts > MaxAttempts) { if (S.KillSwitch) LockDown(); else GiveUp(); return; }
             recovering = true;
             note = "mihomo упал — перезапуск " + attempts + "/" + MaxAttempts;
             Notify("MihomoBar", "mihomo упал. Перезапуск " + attempts + " из " + MaxAttempts);
@@ -670,6 +768,17 @@ namespace MihomoBar
                 });
             });
         }
+
+        // Kill switch выключен: после исчерпания попыток просто останавливаемся, интернет не блокируем.
+        void GiveUp()
+        {
+            desired = false;
+            note = "⚠ Прокси не работает: " + MaxAttempts + " перезапусков не помогли. Kill switch выключен — интернет не заблокирован";
+            Notify("MihomoBar", "Прокси упал, перезапуски исчерпаны. Kill switch выключен — интернет НЕ заблокирован.");
+            Rebuild(false);
+        }
+
+        void ToggleKillSwitch() { S.KillSwitch = !S.KillSwitch; S.Save(); Rebuild(false); }
 
         void LockDown()
         {
@@ -941,6 +1050,7 @@ namespace MihomoBar
 
         void Quit()
         {
+            if (updating) { timer.Stop(); tray.Visible = false; tray.Dispose(); Application.Exit(); return; }   // обновление: ядро и блокировку оставляем как есть
             // Сначала спрашиваем — состояние (desired, блокировка) меняем только после подтверждения выхода.
             bool stopCore = false;
             if (Core.Running())
@@ -1012,6 +1122,8 @@ namespace MihomoBar
             dinfo("Путь ядра: " + P.CoreExe());
             dinfo("wintun.dll: " + (File.Exists(Path.Combine(P.CoreDir(), "wintun.dll")) ? "найден" : "НЕ НАЙДЕН"));
             dinfo("API ядра: " + (running ? (apiOK ? "доступен" : "не отвечает") : "ядро остановлено"));
+            dinfo("Версия MihomoBar: " + (Upd.CurrentVersion() ?? "неизвестна"));
+            dinfo("Kill switch: " + (S.KillSwitch ? "включён" : "выключен"));
             dinfo("Блокировка интернета: " + (blocked ? "включена" : "выключена"));
             dinfo("Последняя ошибка: " + (lastError == null ? "нет" : (lastError.Length > 70 ? lastError.Substring(0, 70) : lastError).Replace("\n", " ")));
             diag.DropDownItems.Add(new ToolStripSeparator());
@@ -1021,10 +1133,176 @@ namespace MihomoBar
             menu.Items.Add(diag);
 
             menu.Items.Add(new ToolStripSeparator());
+            var ks = new ToolStripMenuItem("Kill switch: блокировать интернет при сбое прокси") { Checked = S.KillSwitch };
+            ks.Click += delegate { ToggleKillSwitch(); };
+            menu.Items.Add(ks);
             var auto = new ToolStripMenuItem("Запускать при входе") { Checked = Autostart.Enabled() };
             auto.Click += delegate { ToggleAutostart(); };
             menu.Items.Add(auto);
+            var au = new ToolStripMenuItem("Проверять обновления автоматически") { Checked = S.AutoUpdate };
+            au.Click += delegate { S.AutoUpdate = !S.AutoUpdate; S.Save(); Rebuild(false); };
+            menu.Items.Add(au);
+            act(availableVersion != null ? "⬆ Доступна версия " + availableVersion + " — установить…" : "Проверить обновления…", delegate { RunUpdateCheck(true); }, !updateBusy);
             act("Выход", Quit, true);
+        }
+    }
+
+    // ---- обновления ----
+    // Цепочка доверия: подпись ECDSA P-256 файла SHA256SUMS.txt (открытый ключ вшит) → SHA-256 нового MihomoBar.exe →
+    // проверка версии файла. Замена: работающий exe переименовывается в .old, новый встаёт на его место, затем перезапуск.
+    static class Upd
+    {
+        // Открытый ключ P-256 (формат 04‖X‖Y, hex). Закрытый ключ — только у автора релизов.
+        public const string PublicKeyHex = "0470d7739dcbb9a2a376e4d3e64e5a807a4ad58148dbb0bad321fcd0e83bd829fd755c98a971e0a16f0bb10b9314d35e535df5965c9511531289064cc6fbcf181c";
+        public const string Repo = "polons123/mihomobar";
+        const int MaxMeta = 1000000, MaxPackage = 20000000;
+
+        public static long Now() { return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+
+        // Версия запущенного приложения (из сборки); MIHOMOBAR_UPDATE_VERSION подменяет её для проверки.
+        public static string CurrentVersion()
+        {
+            string o = Environment.GetEnvironmentVariable("MIHOMOBAR_UPDATE_VERSION");
+            if (!string.IsNullOrEmpty(o)) return o;
+            try { var v = Assembly.GetExecutingAssembly().GetName().Version; return v.Major + "." + v.Minor + "." + v.Build; } catch { return null; }
+        }
+
+        public static int[] Parse(string s)
+        {
+            if (s == null) return null;
+            if (s.StartsWith("v")) s = s.Substring(1);
+            var p = s.Split('.');
+            if (p.Length != 3) return null;
+            var r = new int[3];
+            for (int i = 0; i < 3; i++)
+            {
+                if (p[i].Length == 0 || p[i].Length > 9 || !p[i].All(c => c >= '0' && c <= '9')) return null;
+                r[i] = int.Parse(p[i]);
+            }
+            return r;
+        }
+        public static bool IsNewer(string a, string b)
+        {
+            var x = Parse(a); var y = Parse(b);
+            if (x == null || y == null) return false;
+            for (int i = 0; i < 3; i++) if (x[i] != y[i]) return x[i] > y[i];
+            return false;
+        }
+
+        public static Dictionary<string, string> ParseSums(string text)
+        {
+            var r = new Dictionary<string, string>();
+            foreach (var line in text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int sp = line.IndexOf(' ');
+                if (sp != 64) continue;
+                string h = line.Substring(0, 64).ToLowerInvariant();
+                if (!h.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) continue;
+                string name = line.Substring(65).Trim();
+                if (name.StartsWith("*")) name = name.Substring(1);
+                r[name] = h;
+            }
+            return r;
+        }
+
+        static byte[] Hex(string s)
+        {
+            var b = new byte[s.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
+            return b;
+        }
+
+        // DER (SEQUENCE{INTEGER r, INTEGER s}, как выдаёт openssl) → r‖s по 32 байта (формат .NET).
+        static byte[] DerToRaw(byte[] d)
+        {
+            int i = 0;
+            if (d.Length < 8 || d[i++] != 0x30) return null;
+            if ((d[i] & 0x80) != 0) i += 1 + (d[i] & 0x7F); else i++;
+            var raw = new byte[64];
+            for (int k = 0; k < 2; k++)
+            {
+                if (i + 2 > d.Length || d[i++] != 0x02) return null;
+                int len = d[i++];
+                if (len == 0 || i + len > d.Length) return null;
+                while (len > 32 && d[i] == 0) { i++; len--; }
+                if (len > 32) return null;
+                Array.Copy(d, i, raw, k * 32 + (32 - len), len);
+                i += len;
+            }
+            return raw;
+        }
+
+        public static bool Verify(byte[] message, byte[] derSig, string keyHex)
+        {
+            try
+            {
+                byte[] pub = Hex(keyHex), sig = DerToRaw(derSig);
+                if (pub.Length != 65 || pub[0] != 4 || sig == null) return false;
+                var blob = new byte[8 + 64];
+                BitConverter.GetBytes(0x31534345).CopyTo(blob, 0);   // BCRYPT_ECDSA_PUBLIC_P256_MAGIC «ECS1»
+                BitConverter.GetBytes(32).CopyTo(blob, 4);
+                Array.Copy(pub, 1, blob, 8, 64);
+                using (var key = CngKey.Import(blob, CngKeyBlobFormat.EccPublicBlob))
+                using (var ec = new ECDsaCng(key))
+                {
+                    ec.HashAlgorithm = CngAlgorithm.Sha256;
+                    return ec.VerifyData(message, sig);
+                }
+            }
+            catch { return false; }
+        }
+
+        static string Sha256(byte[] data)
+        {
+            using (var h = SHA256.Create()) return BitConverter.ToString(h.ComputeHash(data)).Replace("-", "").ToLowerInvariant();
+        }
+
+        static string ExePath() { return Application.ExecutablePath; }
+
+        // Удаляет остаток прежней версии после обновления.
+        public static void CleanOld()
+        {
+            try { File.Delete(ExePath() + ".old"); } catch { }
+            try { File.Delete(ExePath() + ".new"); } catch { }
+        }
+
+        // Скачивает, проверяет и подменяет exe; возвращает текст ошибки или null (тогда запущен перезапуск).
+        public static string DownloadAndApply(string version)
+        {
+            try
+            {
+                string bas = Environment.GetEnvironmentVariable("MIHOMOBAR_UPDATE_BASE") ?? "https://github.com/" + Repo + "/releases/download";
+                string name = "MihomoBar.exe";
+                Func<string, string> url = delegate(string n) { return bas + "/v" + version + "/" + n; };
+                byte[] sums = Core.Http(url("SHA256SUMS.txt"), 30000), sig = Core.Http(url("SHA256SUMS.txt.sig"), 30000);
+                if (sums.Length > MaxMeta) return "список контрольных сумм слишком большой";
+                string key = Environment.GetEnvironmentVariable("MIHOMOBAR_UPDATE_PUBKEY") ?? PublicKeyHex;
+                if (!Verify(sums, sig, key)) return "подпись списка контрольных сумм не прошла проверку: файлы релиза не заслуживают доверия";
+                string expected;
+                if (!ParseSums(Encoding.UTF8.GetString(sums)).TryGetValue(name, out expected)) return "в списке контрольных сумм нет файла " + name;
+
+                byte[] exe = Core.Http(url(name), 120000);
+                if (exe.Length > MaxPackage || exe.Length < 10000) return "файл обновления неверного размера";
+                if (Sha256(exe) != expected) return "контрольная сумма загруженного файла не совпала";
+
+                string cur = ExePath(), nw = cur + ".new", old = cur + ".old";
+                File.WriteAllBytes(nw, exe);
+                // проверяем, что это действительно нужная версия нашей программы
+                var vi = FileVersionInfo.GetVersionInfo(nw);
+                string fv = vi.FileMajorPart + "." + vi.FileMinorPart + "." + vi.FileBuildPart;
+                if (fv != version || vi.OriginalFilename != "MihomoBar.exe") { File.Delete(nw); return "загруженный файл не тот (версия или имя не совпали)"; }
+
+                try { File.Delete(old); } catch { }
+                File.Move(cur, old);
+                try { File.Move(nw, cur); }
+                catch (Exception e) { try { File.Move(old, cur); } catch { } return "не удалось поставить новую версию: " + e.Message; }
+
+                // новый экземпляр стартует после выхода этого (иначе его остановит мьютекс единственного экземпляра)
+                var psi = new ProcessStartInfo("cmd.exe", "/c ping -n 4 127.0.0.1 >nul & start \"\" \"" + cur + "\"") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden };
+                Process.Start(psi);
+                return null;
+            }
+            catch (Exception e) { return e.Message; }
         }
     }
 
@@ -1071,6 +1349,8 @@ namespace MihomoBar
         static void Main(string[] args)
         {
             if (args.Length == 3 && args[0] == "--selftest") { SelfTest.Run(args[1], args[2]); return; }
+            // Скрытая проверка обновления без GUI: MihomoBar.exe --apply-update <версия> (скачать, проверить, заменить себя и перезапустить)
+            if (args.Length == 2 && args[0] == "--apply-update") { string e = Upd.DownloadAndApply(args[1]); File.WriteAllText(Path.Combine(Path.GetTempPath(), "mihomobar-update-result.txt"), e ?? "ok"); return; }
             bool created;
             using (var mutex = new Mutex(true, @"Global\MihomoBar", out created))
             {

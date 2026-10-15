@@ -109,7 +109,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var apiOK = false
     var lastError: String?
     var firstRefresh = true
+    var updating = false       // идёт замена приложения: выходим без вопросов, ядро и блокировку не трогаем
+    var updateBusy = false
+    var availableVersion: String?
     var inFlight: Bool { busy || recovering }
+
+    /// Kill switch: после неудачных перезапусков блокировать интернет (по умолчанию включено).
+    var killSwitch: Bool {
+        get { UserDefaults.standard.object(forKey: "killSwitch") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "killSwitch") }
+    }
 
     var configURL: String? {
         get { UserDefaults.standard.string(forKey: urlKey) }
@@ -147,6 +156,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DispatchQueue.main.async { self.blocked = true; self.rebuild(); self.offerUnblock() }
             }
         }
+        checkUpdatesOnLaunch()
         // Перед первым стартом — просим ссылку на конфиг.
         if configURL == nil && !useLocal { DispatchQueue.main.async { self.askURL(firstRun: true) } }
     }
@@ -222,7 +232,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         stableSince = nil
         attempts += 1
-        if attempts > maxAttempts { lockDown(); return }
+        if attempts > maxAttempts { if killSwitch { lockDown() } else { giveUp() }; return }
         recovering = true
         note = "mihomo упал — перезапуск \(attempts)/\(maxAttempts)"
         notify("MihomoBar", "mihomo упал. Перезапуск \(attempts) из \(maxAttempts)")
@@ -236,6 +246,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
     }
+
+    /// Kill switch выключен: после исчерпания попыток просто останавливаемся, интернет не блокируем.
+    func giveUp() {
+        desired = false
+        note = "⚠ Прокси не работает: \(maxAttempts) перезапусков не помогли. Kill switch выключен — интернет не заблокирован"
+        notify("MihomoBar", "Прокси упал, перезапуски исчерпаны. Kill switch выключен — интернет НЕ заблокирован.")
+        rebuild()
+    }
+
+    @objc func toggleKillSwitch() { killSwitch.toggle(); rebuild() }
 
     func lockDown() {
         desired = false; blocked = true; busy = true; rebuild()
@@ -427,6 +447,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dinfo("Хелпер: " + (helperVersion.map { "v\($0)" + (helperOutdated ? " (устарел, нужна v\(expectedHelper))" : " (ок)") } ?? "недоступен"))
         dinfo("Ядро: " + (coreVer ?? "не установлено — скачается при включении"))
         dinfo("API ядра: " + (running ? (apiOK ? "доступен" : "не отвечает") : "ядро остановлено"))
+        dinfo("Версия MihomoBar: " + (Upd.currentVersion ?? "неизвестна"))
+        dinfo("Kill switch: " + (killSwitch ? "включён" : "выключен"))
         dinfo("Блокировка интернета: " + (blocked ? "включена" : "выключена"))
         dinfo("Последняя ошибка: " + (lastError.map { String($0.prefix(70)) } ?? "нет"))
         diag.addItem(.separator())
@@ -436,9 +458,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         diagItem.submenu = diag
         menu.addItem(diagItem)
         menu.addItem(.separator())
+        let ks = NSMenuItem(title: "Kill switch: блокировать интернет при сбое прокси", action: #selector(toggleKillSwitch), keyEquivalent: "")
+        ks.target = self; ks.state = killSwitch ? .on : .off
+        menu.addItem(ks)
         let li = NSMenuItem(title: "Запускать при входе", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         li.target = self; li.state = launchAtLogin ? .on : .off
         menu.addItem(li)
+        let au = NSMenuItem(title: "Проверять обновления автоматически", action: #selector(toggleAutoUpdate), keyEquivalent: "")
+        au.target = self; au.state = autoUpdate ? .on : .off
+        menu.addItem(au)
+        if let v = availableVersion {
+            act("⬆ Доступна версия \(v) — установить…", #selector(checkUpdatesManually), enabled: !updateBusy)
+        } else {
+            act("Проверить обновления…", #selector(checkUpdatesManually), enabled: !updateBusy)
+        }
         menu.addItem(NSMenuItem(title: "Выход", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -520,6 +553,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: выход
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if updating { return .terminateNow }   // обновление: ядро и блокировку оставляем как есть
         // Сначала спрашиваем — состояние (desired, блокировка) меняем только после подтверждения выхода.
         let up = sudoCtl(["status"]).out.hasPrefix("running")
         var stopCore = false
@@ -735,9 +769,270 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// MARK: - Обновления
+
+/// Проверка и установка обновлений из GitHub Releases.
+/// Цепочка доверия: подпись ECDSA P-256 файла SHA256SUMS.txt (открытый ключ вшит) → SHA-256 образа MihomoBar.dmg →
+/// проверка распакованного .app (bundle id, версия, подпись кода). Настройки лежат вне .app и при замене не затрагиваются.
+enum Upd {
+    /// Открытый ключ P-256 (формат 04‖X‖Y, hex). Закрытый ключ — только у автора релизов.
+    static let publicKeyHex = "0470d7739dcbb9a2a376e4d3e64e5a807a4ad58148dbb0bad321fcd0e83bd829fd755c98a971e0a16f0bb10b9314d35e535df5965c9511531289064cc6fbcf181c"
+    static let repo = "polons123/mihomobar"
+    static let maxMeta = 1_000_000
+    static let maxPackage = 50_000_000
+
+    static var env: [String: String] { ProcessInfo.processInfo.environment }
+    /// Версия запущенного приложения; MIHOMOBAR_UPDATE_VERSION подменяет её для проверки.
+    static var currentVersion: String? {
+        env["MIHOMOBAR_UPDATE_VERSION"] ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    }
+
+    static func parseVersion(_ s: String) -> [Int]? {
+        let t = s.hasPrefix("v") ? String(s.dropFirst()) : s
+        let parts = t.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } }) else { return nil }
+        let nums = parts.compactMap { Int($0) }
+        return nums.count == 3 ? nums : nil
+    }
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        guard let x = parseVersion(a), let y = parseVersion(b) else { return false }
+        return x != y && !x.lexicographicallyPrecedes(y)
+    }
+    static func parseSums(_ text: String) -> [String: String] {
+        var r: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let p = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard p.count == 2, p[0].count == 64, p[0].allSatisfy(\.isHexDigit) else { continue }
+            var name = p[1].trimmingCharacters(in: .whitespaces)
+            if name.hasPrefix("*") { name.removeFirst() }
+            r[name] = p[0].lowercased()
+        }
+        return r
+    }
+    static func hexData(_ s: String) -> Data? {
+        guard s.count % 2 == 0 else { return nil }
+        var d = Data(); var i = s.startIndex
+        while i < s.endIndex {
+            let n = s.index(i, offsetBy: 2)
+            guard let b = UInt8(s[i..<n], radix: 16) else { return nil }
+            d.append(b); i = n
+        }
+        return d
+    }
+    /// Подпись — DER (как выдаёт `openssl dgst -sha256 -sign`).
+    static func verify(message: Data, signature: Data, keyHex: String = publicKeyHex) -> Bool {
+        guard let raw = hexData(keyHex), let key = try? P256.Signing.PublicKey(x963Representation: raw),
+              let sig = try? P256.Signing.ECDSASignature(derRepresentation: signature) else { return false }
+        return key.isValidSignature(sig, for: message)
+    }
+    static func sha256(_ url: URL) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        var hasher = SHA256()
+        while let c = try? h.read(upToCount: 1 << 20), !c.isEmpty { hasher.update(data: c) }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+extension App {
+    var autoUpdate: Bool {
+        get { UserDefaults.standard.object(forKey: "updateAutoCheck") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "updateAutoCheck") }
+    }
+
+    @objc func toggleAutoUpdate() { autoUpdate.toggle(); rebuild() }
+    @objc func checkUpdatesManually() { runUpdateCheck(manual: true) }
+
+    /// Фоновая проверка при запуске: не чаще раза в сутки, без сообщений, если обновлений нет или ошибка.
+    func checkUpdatesOnLaunch() {
+        guard autoUpdate, Upd.currentVersion != nil else { return }
+        let last = UserDefaults.standard.double(forKey: "updateLastCheck")
+        guard Date().timeIntervalSince1970 - last > 24 * 3600 else { return }
+        runUpdateCheck(manual: false)
+    }
+
+    func runUpdateCheck(manual: Bool) {
+        guard !updateBusy else { return }
+        guard let current = Upd.currentVersion, Upd.parseVersion(current) != nil else {
+            if manual { alert("Не удалось определить версию приложения (запуск не из пакета .app).") }
+            return
+        }
+        updateBusy = true; rebuild()
+        DispatchQueue.global().async {
+            let api = Upd.env["MIHOMOBAR_UPDATE_API"] ?? "https://api.github.com/repos/\(Upd.repo)/releases/latest"
+            let (data, err) = self.httpData(api, timeout: 15)
+            var release: (version: String, notes: String, page: String)?
+            if let data, let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let tag = obj["tag_name"] as? String, Upd.parseVersion(tag) != nil,
+               (obj["draft"] as? Bool) != true, (obj["prerelease"] as? Bool) != true {
+                release = (tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, (obj["body"] as? String) ?? "",
+                           (obj["html_url"] as? String) ?? "https://github.com/\(Upd.repo)/releases")
+            }
+            DispatchQueue.main.async {
+                self.updateBusy = false
+                if let release {
+                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "updateLastCheck")
+                    if Upd.isNewer(release.version, than: current) {
+                        self.availableVersion = release.version
+                        self.rebuild()
+                        if manual || UserDefaults.standard.string(forKey: "updateSkipped") != release.version {
+                            self.offerUpdate(release, current: current)
+                        }
+                    } else {
+                        self.availableVersion = nil; self.rebuild()
+                        if manual { self.alert("У вас последняя версия: MihomoBar \(current).") }
+                    }
+                } else {
+                    self.rebuild()
+                    let why = err ?? "не удалось разобрать ответ сервера обновлений"
+                    self.lastError = "проверка обновлений: \(why)"
+                    if manual { self.alert("Не удалось проверить обновления: \(why)") }
+                }
+            }
+        }
+    }
+
+    /// Автоустановка возможна, если приложение запущено из .app вне «переноса» Gatekeeper и рядом можно писать.
+    var updateBlocker: String? {
+        let url = Bundle.main.bundleURL
+        guard url.pathExtension == "app" else { return "приложение запущено не из пакета .app" }
+        if url.path.contains("/AppTranslocation/") { return "приложение запущено прямо из загрузок или образа: переместите его в «Программы» и запустите оттуда" }
+        if !FileManager.default.isWritableFile(atPath: url.deletingLastPathComponent().path) { return "нет прав на запись в папку \(url.deletingLastPathComponent().path)" }
+        return nil
+    }
+
+    func offerUpdate(_ r: (version: String, notes: String, page: String), current: String) {
+        let blocker = updateBlocker
+        let a = NSAlert()
+        a.messageText = "Доступна версия \(r.version)"
+        var info = "Установлена версия \(current)."
+        let notes = r.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !notes.isEmpty { info += "\n\n" + String(notes.prefix(700)) }
+        if let blocker { info += "\n\nАвтоустановка недоступна: \(blocker)." }
+        else { info += "\n\nНастройки сохранятся. Прокси продолжит работать, приложение перезапустится." }
+        a.informativeText = info
+        a.addButton(withTitle: blocker == nil ? "Установить и перезапустить" : "Открыть страницу загрузки")
+        a.addButton(withTitle: "Позже")
+        a.addButton(withTitle: "Пропустить эту версию")
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            if blocker == nil { installUpdate(r.version) }
+            else if let u = URL(string: r.page), u.scheme == "https" { NSWorkspace.shared.open(u) }
+        case .alertThirdButtonReturn:
+            UserDefaults.standard.set(r.version, forKey: "updateSkipped")
+        default: break
+        }
+    }
+
+    func installUpdate(_ version: String) {
+        updateBusy = true; busy = true; note = "Загрузка обновления \(version)…"; rebuild()
+        DispatchQueue.global().async {
+            let err = self.downloadAndApplyUpdate(version)
+            DispatchQueue.main.async {
+                if let err {
+                    self.updateBusy = false; self.busy = false; self.note = nil
+                    self.lastError = "обновление: \(err)"
+                    self.alert("Не удалось установить обновление: \(err)\n\nУстановленная версия не изменена.")
+                    self.rebuild()
+                } else {
+                    self.updating = true
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    /// Скачивает, проверяет и готовит замену .app; возвращает текст ошибки или nil (тогда запущен скрипт замены).
+    func downloadAndApplyUpdate(_ version: String) -> String? {
+        let base = Upd.env["MIHOMOBAR_UPDATE_BASE"] ?? "https://github.com/\(Upd.repo)/releases/download"
+        let name = "MihomoBar.dmg"
+        func url(_ n: String) -> String { "\(base)/v\(version)/\(n)" }
+        let (sums, e1) = httpData(url("SHA256SUMS.txt"), timeout: 30)
+        let (sig, e2) = httpData(url("SHA256SUMS.txt.sig"), timeout: 30)
+        guard let sums, let sig, sums.count < Upd.maxMeta else { return "не удалось загрузить список контрольных сумм (\(e1 ?? e2 ?? "?"))" }
+        let key = Upd.env["MIHOMOBAR_UPDATE_PUBKEY"] ?? Upd.publicKeyHex
+        guard Upd.verify(message: sums, signature: sig, keyHex: key) else {
+            return "подпись списка контрольных сумм не прошла проверку: файлы релиза не заслуживают доверия"
+        }
+        guard let expected = Upd.parseSums(String(decoding: sums, as: UTF8.self))[name] else { return "в списке контрольных сумм нет файла \(name)" }
+
+        let fm = FileManager.default
+        let stage = fm.temporaryDirectory.appendingPathComponent("mihomobar-update-\(version)", isDirectory: true)
+        try? fm.removeItem(at: stage)
+        do { try fm.createDirectory(at: stage, withIntermediateDirectories: true) } catch { return "не удалось создать папку: \(error.localizedDescription)" }
+        let (dmgData, e3) = httpData(url(name), timeout: 120)
+        guard let dmgData, dmgData.count <= Upd.maxPackage else { return "не удалось загрузить \(name) (\(e3 ?? "слишком большой"))" }
+        let dmg = stage.appendingPathComponent(name)
+        do { try dmgData.write(to: dmg) } catch { return "не удалось сохранить файл: \(error.localizedDescription)" }
+        guard Upd.sha256(dmg) == expected else { return "контрольная сумма загруженного файла не совпала" }
+
+        // Монтируем образ только для чтения, копируем .app, отключаем.
+        let mnt = stage.appendingPathComponent("mnt", isDirectory: true)
+        try? fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+        func run(_ exe: String, _ args: [String]) -> Int32 {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch { return -1 }
+            p.waitUntilExit(); return p.terminationStatus
+        }
+        guard run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-noverify", "-mountpoint", mnt.path, dmg.path]) == 0 else { return "не удалось открыть образ" }
+        let newApp = stage.appendingPathComponent("MihomoBar.app")
+        let copied = run("/usr/bin/ditto", [mnt.appendingPathComponent("MihomoBar.app").path, newApp.path])
+        _ = run("/usr/bin/hdiutil", ["detach", "-quiet", "-force", mnt.path])
+        guard copied == 0 else { return "в образе нет MihomoBar.app" }
+        guard let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist")),
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+              info["CFBundleShortVersionString"] as? String == version else { return "в образе не тот пакет (идентификатор или версия не совпали)" }
+        guard run("/usr/bin/codesign", ["--verify", "--strict", "--deep", newApp.path]) == 0 else { return "подпись пакета в образе нарушена" }
+
+        let target = Bundle.main.bundleURL
+        let backup = fm.temporaryDirectory.appendingPathComponent("mihomobar-previous", isDirectory: true).appendingPathComponent("MihomoBar.app")
+        let script = stage.appendingPathComponent("replace.sh")
+        do { try Upd.replaceScript.write(to: script, atomically: true, encoding: .utf8) } catch { return "не удалось подготовить замену" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = [script.path, String(ProcessInfo.processInfo.processIdentifier), newApp.path, target.path, backup.path]
+        p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return "не удалось запустить замену: \(error.localizedDescription)" }
+        return nil
+    }
+}
+
+extension Upd {
+    /// Ждёт выхода приложения, меняет пакет (прежний сохраняется), снимает карантин и запускает новую версию; при ошибке возвращает прежнюю.
+    static let replaceScript = """
+    #!/bin/sh
+    PID="$1"; NEW="$2"; TARGET="$3"; BACKUP="$4"
+    LOG="$HOME/Library/Logs/MihomoBar-update.log"
+    say() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+    n=0
+    while kill -0 "$PID" 2>/dev/null; do
+      n=$((n+1)); [ "$n" -gt 150 ] && { say "приложение не закрылось, обновление отменено"; exit 1; }
+      sleep 0.2
+    done
+    mkdir -p "$(dirname "$BACKUP")"; rm -rf "$BACKUP"
+    if ! mv "$TARGET" "$BACKUP"; then say "не удалось убрать прежнюю версию"; open "$TARGET"; exit 1; fi
+    if ! mv "$NEW" "$TARGET"; then
+      say "не удалось поставить новую версию, возвращаю прежнюю"
+      rm -rf "$TARGET"; mv "$BACKUP" "$TARGET"; open "$TARGET"; exit 1
+    fi
+    xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null
+    say "обновлено: $TARGET"
+    open "$TARGET"
+    """
+}
+
 // Скрытая проверка установки ядра без GUI: MihomoBar --ensure-core
 if CommandLine.arguments.contains("--ensure-core") {
     let e = App().ensureCore()
+    print(e ?? "ok")
+    exit(e == nil ? 0 : 1)
+}
+
+// Скрытая проверка обновления без GUI: MihomoBar --apply-update <версия> (скачать, проверить, заменить себя и перезапустить)
+if let i = CommandLine.arguments.firstIndex(of: "--apply-update"), i + 1 < CommandLine.arguments.count {
+    let e = App().downloadAndApplyUpdate(CommandLine.arguments[i + 1])
     print(e ?? "ok")
     exit(e == nil ? 0 : 1)
 }
