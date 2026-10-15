@@ -22,7 +22,7 @@ open MihomoBar.app   # при первом запуске предложит у�
 См. [windows/README.md](windows/README.md). Сборка — `windows\build.cmd` (штатный .NET Framework 4, SDK не нужен).
 
 ## Готовые сборки
-Скачайте из Releases: `MihomoBar.dmg` (macOS) или `MihomoBar-windows.zip`.
+Скачайте из Releases: `MihomoBar.dmg` (macOS, универсальный: Apple Silicon и Intel) или `MihomoBar-windows-x64.zip` / `MihomoBar-windows-arm64.zip` (Windows под вашу архитектуру).
 - **macOS** (14+, универсальная сборка Apple Silicon + Intel; Intel-часть не проверялась на реальном Mac): откройте DMG, перетащите `MihomoBar.app` в «Программы». Приложение не нотаризовано (подпись ad-hoc), поэтому один раз выполните в терминале `xattr -cr /Applications/MihomoBar.app` (или «Системные настройки» → «Конфиденциальность и безопасность» → «Всё равно открыть»). При первом запуске приложение само предложит установить root-хелпер (системное окно пароля), затем попросит ссылку на конфиг.
 - **Windows:** `MihomoBar.exe` не подписан сертификатом издателя — SmartScreen покажет предупреждение: «Подробнее» → «Выполнить в любом случае». Перед распаковкой можно снять пометку: свойства zip → «Разблокировать».
 
@@ -31,7 +31,7 @@ open MihomoBar.app   # при первом запуске предложит у�
 - Клики по меню и уведомления в автотестах не проверялись; на реальном x64-ПК с Windows сборка не запускалась (проверено на ARM64 в виртуальной машине).
 
 ## Выпуск релиза (для автора)
-Версия — файл `VERSION` (общая для macOS и Windows). Собрать `windows\build.cmd` в Windows, затем `./release.sh` на Mac: соберёт DMG и zip, подпишет `SHA256SUMS.txt` ключом `~/.config/mihomobar/update-signing-key.pem` и напечатает команду `gh release create`. Ключ нельзя терять или менять: открытый ключ вшит в оба приложения (`MihomoBar.swift`, `windows/MihomoBar.cs`), иначе старые установки перестанут принимать обновления. Имена файлов релиза (`MihomoBar.dmg`, `MihomoBar.exe`, `MihomoBar-windows.zip`) использует обновление. Первый релиз с этим кодом нужно ставить вручную.
+Версия — файл `VERSION` (общая для macOS и Windows). Собрать `windows\build.cmd` в Windows, затем `./release.sh` на Mac: соберёт DMG и zip, подпишет `SHA256SUMS.txt` ключом `~/.config/mihomobar/update-signing-key.pem` и напечатает команду `gh release create`. Ключ нельзя терять или менять: открытый ключ вшит в оба приложения (`MihomoBar.swift`, `windows/MihomoBar.cs`), иначе старые установки перестанут принимать обновления. Имена файлов релиза (`MihomoBar.dmg`, `MihomoBar.exe`, `MihomoBar-windows-x64.zip`, `MihomoBar-windows-arm64.zip`) использует обновление. Первый релиз с этим кодом нужно ставить вручную.
 
 ## Лицензия
 GPL-3.0. Использует mihomo (GPL-3.0) и Wintun (см. `windows/dist/core/WINTUN-LICENSE.txt` в релизных сборках).

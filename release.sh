@@ -12,8 +12,14 @@ VER=$(cat VERSION)
 OUT=release/v$VER; rm -rf "$OUT"; mkdir -p "$OUT"
 cp MihomoBar.dmg "$OUT/"
 cp windows/dist/MihomoBar.exe "$OUT/MihomoBar.exe"
-(cd windows/dist && find . -name .DS_Store -delete && zip -qr "../../$OUT/MihomoBar-windows.zip" .)
-(cd "$OUT" && shasum -a 256 MihomoBar.dmg MihomoBar.exe MihomoBar-windows.zip > SHA256SUMS.txt \
+# Windows: отдельный пакет под каждую архитектуру (exe один и тот же, AnyCPU; ядро и wintun — свои)
+find windows/dist -name .DS_Store -delete
+for A in x64 arm64; do
+  S=$(mktemp -d)/MihomoBar; mkdir -p "$S/core/$A"
+  cp windows/dist/MihomoBar.exe "$S/"; cp windows/dist/core/$A/* "$S/core/$A/"; cp windows/dist/core/WINTUN-LICENSE.txt "$S/core/"
+  (cd "$(dirname "$S")" && zip -qr "$OLDPWD/$OUT/MihomoBar-windows-$A.zip" MihomoBar)
+done
+(cd "$OUT" && shasum -a 256 MihomoBar.dmg MihomoBar.exe MihomoBar-windows-x64.zip MihomoBar-windows-arm64.zip > SHA256SUMS.txt \
   && openssl dgst -sha256 -sign "$KEY" -out SHA256SUMS.txt.sig SHA256SUMS.txt)
 echo "готово: $OUT"; ls -la "$OUT"
 echo "публикация: gh release create v$VER $OUT/* --title v$VER --notes '...'"
