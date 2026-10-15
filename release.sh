@@ -7,7 +7,6 @@ cd "$(dirname "$0")"
 KEY="${UPDATE_SIGNING_KEY:-$HOME/.config/mihomobar/update-signing-key.pem}"
 [ -f "$KEY" ] || { echo "нет ключа подписи $KEY" >&2; exit 1; }
 VER=$(cat VERSION)
-# Подписанный exe из CI (артефакт MihomoBar-signed) положить в windows/dist/MihomoBar.exe до запуска скрипта.
 [ -f windows/dist/MihomoBar.exe ] || { echo "нет windows/dist/MihomoBar.exe" >&2; exit 1; }
 ./build.sh dmg
 OUT=release/v$VER; rm -rf "$OUT"; mkdir -p "$OUT"
