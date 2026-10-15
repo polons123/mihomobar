@@ -1,0 +1,62 @@
+name: Windows build
+
+# Собирает MihomoBar.exe штатным csc.exe (.NET Framework 4) и, если настроен SignPath, подписывает его.
+# Без секретов/переменных SignPath шаг подписи пропускается — артефакт остаётся неподписанным.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['windows/**', 'VERSION', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['windows/**', 'VERSION']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Сборка
+        shell: cmd
+        run: windows\build.cmd
+
+      - name: Проверка версии exe
+        shell: pwsh
+        run: |
+          $want = (Get-Content VERSION -Raw).Trim()
+          $vi = (Get-Item windows/dist/MihomoBar.exe).VersionInfo
+          $got = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart)"
+          if ($got -ne $want) { throw "версия exe $got, ожидалась $want" }
+          "exe $got, $((Get-Item windows/dist/MihomoBar.exe).Length) байт"
+
+      - name: Загрузка неподписанного exe
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: MihomoBar-unsigned
+          path: windows/dist/MihomoBar.exe
+
+      # Подпись через SignPath Foundation (бесплатно для открытых проектов).
+      # Включается, когда в Settings → Secrets and variables → Actions заданы:
+      #   secret SIGNPATH_API_TOKEN; variables SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG.
+      - name: Подпись (SignPath)
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' && github.event_name != 'pull_request' }}
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Загрузка подписанного exe
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' && github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: MihomoBar-signed
+          path: signed/MihomoBar.exe
