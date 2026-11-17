@@ -3,7 +3,9 @@
 # Использование: mihomo-ctl version | core-version | status | blockstatus | install-config (YAML со stdin)
 #                | install-core (бинарь со stdin) | rollback | start | stop | block | unblock
 set -u
-VERSION=5
+umask 077
+VERSION=6
+export LC_ALL=C
 CFGDIR="/usr/local/etc/mihomobar"
 DATA="$CFGDIR/data"      # рабочая папка mihomo (geo, ui, кэш), принадлежит root
 CFG="$CFGDIR/config.yaml"
@@ -17,6 +19,71 @@ PFRULES="$CFGDIR/pf-block.conf"
 ANCHOR="com.apple/mihomobar"
 LOG="/var/log/mihomobar.log"
 LOCKD="/var/run/mihomobar.lock.d"
+DNSSTATE="$CFGDIR/dns-state"
+DNSPID="/var/run/mihomobar-dns.pid"
+SELF="/usr/local/libexec/mihomo-ctl"
+
+# Journal each service before changing it. Never replace a saved original with
+# our own loopback address, including after a helper/app crash.
+dns_apply() {
+  local services service key entry current stage
+  services=$(networksetup -listallnetworkservices) || return 1
+  mkdir -p "$DNSSTATE" || return 1
+  while IFS= read -r service; do
+    case "$service" in ''|An\ asterisk*|\**) continue ;; esac
+    key=$(printf '%s' "$service" | shasum -a 256) || return 1
+    key=${key%% *}; entry="$DNSSTATE/$key"
+    current=$(networksetup -getdnsservers "$service") || return 1
+    if [ ! -d "$entry" ]; then
+      stage=$(mktemp -d "$DNSSTATE/.new.XXXXXX") || return 1
+      printf '%s\n' "$service" > "$stage/service"
+      case "$current" in
+        "There aren't any DNS Servers set on "*) : > "$stage/servers" ;;
+        *) printf '%s\n' "$current" > "$stage/servers" ;;
+      esac
+      mv "$stage" "$entry" || return 1
+    fi
+    if [ "$current" != 127.0.0.1 ]; then
+      networksetup -setdnsservers "$service" 127.0.0.1 || return 1
+    fi
+  done <<< "$services"
+}
+
+dns_restore() {
+  local entry service current servers server rc=0
+  for entry in "$DNSSTATE"/*; do
+    [ -d "$entry" ] || continue
+    service=$(cat "$entry/service") || { rc=1; continue; }
+    current=$(networksetup -getdnsservers "$service") || { rc=1; continue; }
+    # Respect an explicit DNS change made by the user while we were running.
+    if [ "$current" = 127.0.0.1 ]; then
+      servers=()
+      while IFS= read -r server; do
+        [ -z "$server" ] || servers+=("$server")
+      done < "$entry/servers"
+      if [ "${#servers[@]}" -eq 0 ]; then servers=(Empty); fi
+      networksetup -setdnsservers "$service" "${servers[@]}" || { rc=1; continue; }
+    fi
+    rm -rf "$entry"
+  done
+  return "$rc"
+}
+
+dns_ready() {
+  local reply
+  # Do not mistake another resolver on port 53 for Mihomo's DNS listener.
+  [ -f "$PIDF" ] || return 1
+  lsof -nP -a -p "$(cat "$PIDF")" -iUDP:53 -t >/dev/null 2>&1 || return 1
+  reply=$(dig @127.0.0.1 -p 53 localhost A +time=1 +tries=1 +noall +comments 2>/dev/null) || return 1
+  [[ "$reply" == *'status: NOERROR'* || "$reply" == *'status: NXDOMAIN'* ]]
+}
+
+dns_watch_stop() {
+  if [ -f "$DNSPID" ]; then
+    kill "$(cat "$DNSPID")" 2>/dev/null || true
+    rm -f "$DNSPID"
+  fi
+}
 
 running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 
@@ -32,6 +99,7 @@ lock() {
 }
 
 stop() {
+  dns_watch_stop
   if running; then
     kill "$(cat "$PIDF")"
     for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.5; done
@@ -39,6 +107,7 @@ stop() {
   fi
   pkill -x mihomo 2>/dev/null   # заодно ручной запуск через sudo mihomo
   rm -f "$PIDF"
+  dns_restore
 }
 
 blocked() { pfctl -a "$ANCHOR" -sr 2>/dev/null | grep -q "block"; }
@@ -51,6 +120,23 @@ pf_release() {
 }
 
 case "${1:-}" in
+  __dns-watch)
+    # Serialize with start/stop so a delayed watcher cannot reapply DNS after stop.
+    while :; do
+      sleep 2
+      lock
+      if ! running; then
+        if dns_restore; then
+          rm -f "$DNSPID"
+          exit
+        fi
+        echo "не удалось восстановить системный DNS; повтор через 2 секунды" >&2
+      else
+        if ! dns_apply; then echo "не удалось обновить системный DNS" >&2; fi
+      fi
+      rm -rf "$LOCKD"; trap - EXIT
+    done
+    ;;
   version) echo "$VERSION" ;;
   core-version)
     # версия установленного ядра (учитывает обновление из панели); пусто, если ядра нет или оно не запускается
@@ -104,10 +190,22 @@ case "${1:-}" in
     mkdir -p "$DATA"
     [ -f "$CFG" ] || { echo "конфиг ещё не загружен" >&2; exit 2; }
     "$BIN" -t -d "$DATA" -f "$CFG" >/dev/null 2>&1 || { echo "config test failed" >&2; exit 3; }
-    stop
+    stop || { echo "не удалось восстановить прежний DNS" >&2; exit 7; }
     nohup "$BIN" -d "$DATA" -f "$CFG" >"$LOG" 2>&1 &
     echo $! > "$PIDF"
     sleep 1; running || { echo "mihomo завершился, см. $LOG" >&2; exit 4; }
+    ready=false
+    for _ in 1 2 3 4 5; do
+      if dns_ready; then ready=true; break; fi
+      sleep 1
+    done
+    if [ "$ready" != true ] || ! dns_apply; then
+      stop
+      echo "DNS не настроен: нужен dns.enable: true и dns.listen: 127.0.0.1:53; проверьте $LOG" >&2
+      exit 7
+    fi
+    nohup "$SELF" __dns-watch >>"$LOG" 2>&1 &
+    echo $! > "$DNSPID"
     ;;
   stop) lock; stop ;;
   block)
