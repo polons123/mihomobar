@@ -6,3 +6,4 @@ dmg-root/
 release/
 windows/dist/
 windows/obj/
+__pycache__/

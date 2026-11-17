@@ -8,7 +8,7 @@ let urlKey = "configURL"
 let localKey = "localConfigPath"
 let prevConfig = "/usr/local/etc/mihomobar/config.prev.yaml"
 let agentPath = NSString(string: "~/Library/LaunchAgents/local.mihomobar.plist").expandingTildeInPath
-let expectedHelper = "5"   // версия mihomo-ctl, с которой это приложение совместимо
+let expectedHelper = "6"   // версия mihomo-ctl, с которой это приложение совместимо
 let modeKey = "configMode"   // "remote" | "local"
 
 struct Controller {
@@ -313,7 +313,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let a = NSAlert()
         if let hv = helperVersion {
             a.messageText = "Хелпер устарел"
-            a.informativeText = "Установленный mihomo-ctl (версия \(hv)) не совместим с приложением (нужна \(expectedHelper)). Без обновления не работают откат и блокировка. Обновить сейчас? Потребуется пароль администратора."
+            a.informativeText = "Установленный mihomo-ctl (версия \(hv)) не совместим с приложением (нужна \(expectedHelper)). Обновление нужно для управления DNS, отката и блокировки. Обновить сейчас? Потребуется пароль администратора."
             a.addButton(withTitle: "Обновить")
         } else {
             a.messageText = "Нужна первоначальная установка"
